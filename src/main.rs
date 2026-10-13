@@ -7,17 +7,16 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use image::ImageFormat;
 use libflate::gzip;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
@@ -127,6 +126,16 @@ async fn main() -> anyhow::Result<()> {
         orig_dir,
         thumbs_dir,
     };
+    // run cleanup on startup
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        let _ = cleanup(&state_clone).await;
+        loop {
+            tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+            let _ = cleanup(&state_clone).await;
+        }
+    });
+
 
     let app = Router::new()
         .route("/", get(|| async { Json(serde_json::json!({"ok": true})) }))
@@ -254,7 +263,7 @@ async fn upload(
         let resp = UploadResp {
             hash,
             url: abs_url(&state.args.public_url, &url_rel),
-            thumb: abs_url(&state.args.public_url, &thumb_rel),
+            thumb: abs_url(&state.args.public_url, &url_rel),
         };
         return Ok(Json(resp));
     } else {
@@ -272,42 +281,14 @@ async fn upload(
             .execute(&state.pool)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let thumb_path = state.thumbs_dir.join(format!("{hash}-sm.webp"));
-        if !thumb_path.exists() {
-            let _ = generate_thumb(&data, &thumb_path, state.args.thumb_width);
-        }
         let url_rel = format!("/v/{hash}{ext}");
-        let thumb_rel = format!("/v/{hash}-sm.webp");
         let resp = UploadResp {
             hash,
             url: abs_url(&state.args.public_url, &url_rel),
-            thumb: abs_url(&state.args.public_url, &thumb_rel),
+            thumb: abs_url(&state.args.public_url, &url_rel),
         };
         return Ok(Json(resp));
     }
-}
-
-fn generate_thumb(data: &[u8], out_path: &FsPath, max_w: u32) -> anyhow::Result<()> {
-    let img = image::load_from_memory(data)?;
-    let img = img.into_rgb8();
-    let (w, h) = (img.width(), img.height());
-    if w == 0 || h == 0 {
-        return Ok(());
-    }
-    let ratio = (max_w as f32) / (w as f32);
-    if ratio >= 1.0 {
-        let mut buf = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::WebP)?;
-        fs::write(out_path, &buf)?;
-        return Ok(());
-    }
-    let nw = max_w;
-    let nh = ((h as f32) * ratio) as u32;
-    let thumb = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3);
-    let mut buf = Vec::new();
-    thumb.write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::WebP)?;
-    fs::write(out_path, &buf)?;
-    Ok(())
 }
 
 async fn view(
@@ -342,8 +323,9 @@ async fn view(
         if !path.exists() {
             return Err((StatusCode::NOT_FOUND, "not found".to_string()));
         }
-        let bytes = tokio::fs::read(&path).await.map_err(|_| (StatusCode::NOT_FOUND, "not found".to_string()))?;
-        let mut resp = Response::new(Body::from(bytes));
+        let file = tokio::fs::File::open(&path).await.map_err(|_| (StatusCode::NOT_FOUND, "not found".to_string()))?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let mut resp = Response::new(Body::from_stream(stream));
         resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("image/webp"));
         resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=2592000"));
         resp.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
@@ -352,8 +334,9 @@ async fn view(
     if ext == ".svg" {
         let gz_path = state.orig_dir.join(format!("{}{}.gz", _hash, ext));
         if gz_path.exists() {
-            let bytes = tokio::fs::read(&gz_path).await.map_err(|_| (StatusCode::NOT_FOUND, "not found".to_string()))?;
-            let mut resp = Response::new(Body::from(bytes));
+            let file = tokio::fs::File::open(&gz_path).await.map_err(|_| (StatusCode::NOT_FOUND, "not found".to_string()))?;
+            let stream = tokio_util::io::ReaderStream::new(file);
+            let mut resp = Response::new(Body::from_stream(stream));
             resp.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("image/svg+xml"));
             resp.headers_mut().insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
             resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=2592000"));
@@ -375,4 +358,63 @@ async fn view(
     resp.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     let _ = sqlx::query("UPDATE images SET last_access = ? WHERE hash = ?").bind(now_secs()).bind(&_hash).execute(&state.pool).await;
     Ok(resp)
+}
+
+async fn cleanup(state: &AppState) -> anyhow::Result<()> {
+    let now = now_secs();
+    let ttl_days = state.args.ttl_days;
+    if ttl_days > 0.0 {
+        let cutoff = now - ttl_days * 86400.0;
+        let rows = sqlx::query("SELECT hash, ext FROM images WHERE created_at < ?")
+            .bind(cutoff)
+            .fetch_all(&state.pool)
+            .await?;
+        for row in rows {
+            let hash: String = row.get("hash");
+            let ext: String = row.get("ext");
+            let _ = delete_image(state, &hash, &ext).await;
+        }
+    }
+    let quota_mb = state.args.quota_mb;
+    if quota_mb > 0.0 {
+        let quota_bytes = (quota_mb * 1024.0 * 1024.0) as i64;
+        loop {
+            let total: i64 = sqlx::query("SELECT COALESCE(SUM(size), 0) FROM images")
+                .fetch_one(&state.pool)
+                .await?
+                .get(0);
+            if total <= quota_bytes {
+                break;
+            }
+            let oldest = sqlx::query("SELECT hash, ext FROM images ORDER BY last_access ASC LIMIT 1")
+                .fetch_optional(&state.pool)
+                .await?;
+            match oldest {
+                Some(row) => {
+                    let hash: String = row.get("hash");
+                    let ext: String = row.get("ext");
+                    let _ = delete_image(state, &hash, &ext).await;
+                }
+                None => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn delete_image(state: &AppState, hash: &str, ext: &str) -> anyhow::Result<()> {
+    let mut paths = Vec::new();
+    if ext == ".svg" {
+        paths.push(state.orig_dir.join(format!("{hash}{ext}.gz")));
+    }
+    paths.push(state.orig_dir.join(format!("{hash}{ext}")));
+    paths.push(state.thumbs_dir.join(format!("{hash}-sm.webp")));
+    for p in paths {
+        let _ = fs::remove_file(p);
+    }
+    sqlx::query("DELETE FROM images WHERE hash = ?")
+        .bind(hash)
+        .execute(&state.pool)
+        .await?;
+    Ok(())
 }
