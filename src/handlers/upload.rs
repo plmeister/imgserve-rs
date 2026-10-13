@@ -102,8 +102,10 @@ pub async fn upload(
             fs::write(&path, &stored).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         let size = stored.len() as i64;
-        let _ = sqlx::query("INSERT OR REPLACE INTO images (hash, ext, size, svg, created_at, last_access) VALUES (?, ?, ?, 1, ?, ?)")
+        let mimetype = "image/svg+xml";
+        let _ = sqlx::query("INSERT OR REPLACE INTO images (hash, mimetype, ext, size, created_at, last_access) VALUES (?, ?, ?, ?, ?, ?)")
             .bind(&hash)
+            .bind(mimetype)
             .bind(&ext)
             .bind(size)
             .bind(now)
@@ -123,9 +125,10 @@ pub async fn upload(
             fs::write(&path, &data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         let size = data.len() as i64;
-        let _ = sqlx::query("INSERT OR REPLACE INTO images (hash, ext, size, svg, created_at, last_access) VALUES (?, ?, ?, 0, ?, ?)")
+        let mimetype = mime_guess::from_ext(ext.trim_start_matches(".")).first_or_octet_stream().to_string();
+        let _ = sqlx::query("INSERT OR REPLACE INTO images (hash, mimetype, size, created_at, last_access) VALUES (?, ?, ?, ?, ?)")
             .bind(&hash)
-            .bind(&ext)
+            .bind(&mimetype)
             .bind(size)
             .bind(now)
             .bind(now)
