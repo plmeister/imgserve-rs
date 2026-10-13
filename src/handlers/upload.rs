@@ -1,7 +1,7 @@
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, State},
-    http::{header, HeaderMap, StatusCode},
     Json,
+    extract::{DefaultBodyLimit, Multipart, State},
+    http::{HeaderMap, StatusCode, header},
 };
 use libflate::gzip;
 use serde::Serialize;
@@ -17,7 +17,6 @@ use crate::util::{abs_url, now_secs, sniff};
 pub struct UploadResp {
     pub hash: String,
     pub url: String,
-    pub thumb: String,
 }
 
 pub async fn upload(
@@ -27,20 +26,38 @@ pub async fn upload(
 ) -> Result<Json<UploadResp>, (StatusCode, String)> {
     let token = &state.args.token;
     if !token.is_empty() {
-        let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
         match auth {
             Some(a) if a == format!("Bearer {token}") => {}
-            _ => return Err((StatusCode::UNAUTHORIZED, "invalid or missing bearer token".to_string())),
+            _ => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "invalid or missing bearer token".to_string(),
+                ));
+            }
         }
     }
 
     let mut file_name: Option<String> = None;
     let mut data: Vec<u8> = Vec::new();
-    while let Some(field) = multipart.next_field().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+    {
         let name = field.name().unwrap_or("");
         if name == "file" {
-            file_name = field.file_name().map(|s| s.to_string()).or(Some("upload".to_string()));
-            data = field.bytes().await.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?.to_vec();
+            file_name = field
+                .file_name()
+                .map(|s| s.to_string())
+                .or(Some("upload".to_string()));
+            data = field
+                .bytes()
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+                .to_vec();
             break;
         }
     }
@@ -61,30 +78,49 @@ pub async fn upload(
     let mut data = data;
     let max_bytes = (state.args.max_mb.max(1.0)) as usize * 1024 * 1024;
     if data.len() > max_bytes {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("image too large (max {}MB)", state.args.max_mb)));
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("image too large (max {}MB)", state.args.max_mb),
+        ));
     }
     if data.starts_with(b"\x1f\x8b") {
-        let mut decoder = gzip::Decoder::new(&data[..]).map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid gzip: {e}")))?;
+        let mut decoder = gzip::Decoder::new(&data[..])
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid gzip: {e}")))?;
         let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed).map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid gzip: {e}")))?;
+        decoder
+            .read_to_end(&mut decompressed)
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid gzip: {e}")))?;
         data = decompressed;
         if data.len() > max_bytes {
-            return Err((StatusCode::PAYLOAD_TOO_LARGE, format!("image too large after decompression (max {}MB)", state.args.max_mb)));
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "image too large after decompression (max {}MB)",
+                    state.args.max_mb
+                ),
+            ));
         }
     }
 
     let mime_ok = match ext.as_str() {
-        ".png" | ".jpg" | ".jpeg" | ".gif" | ".webp" | ".bmp" | ".tif" | ".tiff" | ".avif" | ".ico" | ".svg" => true,
+        ".png" | ".jpg" | ".jpeg" | ".gif" | ".webp" | ".bmp" | ".tif" | ".tiff" | ".avif"
+        | ".ico" | ".svg" => true,
         _ => false,
     };
     if !mime_ok {
-        return Err((StatusCode::BAD_REQUEST, format!("unsupported type: {}", ext)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unsupported type: {}", ext),
+        ));
     }
     if state.args.reject_svg == 1 && ext == ".svg" {
         return Err((StatusCode::BAD_REQUEST, "svg uploads rejected".to_string()));
     }
     if !sniff(ext.as_str(), &data) {
-        return Err((StatusCode::BAD_REQUEST, format!("content does not match {}", ext)));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("content does not match {}", ext),
+        ));
     }
 
     let mut hasher = Sha256::new();
@@ -96,10 +132,14 @@ pub async fn upload(
     if is_svg {
         let mut encoder = libflate::gzip::Encoder::new(Vec::new()).unwrap();
         encoder.write_all(&data).unwrap();
-        let stored = encoder.finish().into_result().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let stored = encoder
+            .finish()
+            .into_result()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let path = state.orig_dir.join(format!("{hash}{ext}.gz"));
         if !path.exists() {
-            fs::write(&path, &stored).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            fs::write(&path, &stored)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         let size = stored.len() as i64;
         let mimetype = "image/svg+xml";
@@ -117,18 +157,21 @@ pub async fn upload(
         return Ok(Json(UploadResp {
             hash,
             url: abs_url(&state.args.public_url, &url_rel),
-            thumb: abs_url(&state.args.public_url, &url_rel),
         }));
     } else {
         let path = state.orig_dir.join(format!("{hash}{ext}"));
         if !path.exists() {
-            fs::write(&path, &data).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            fs::write(&path, &data)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         let size = data.len() as i64;
-        let mimetype = mime_guess::from_ext(ext.trim_start_matches(".")).first_or_octet_stream().to_string();
-        let _ = sqlx::query("INSERT OR REPLACE INTO images (hash, mimetype, size, created_at, last_access) VALUES (?, ?, ?, ?, ?)")
+        let mimetype = mime_guess::from_ext(ext.trim_start_matches("."))
+            .first_or_octet_stream()
+            .to_string();
+        let _ = sqlx::query("INSERT OR REPLACE INTO images (hash, mimetype, ext, size, created_at, last_access) VALUES (?, ?, ?, ?, ?, ?)")
             .bind(&hash)
             .bind(&mimetype)
+            .bind(&ext)
             .bind(size)
             .bind(now)
             .bind(now)
@@ -139,7 +182,6 @@ pub async fn upload(
         return Ok(Json(UploadResp {
             hash,
             url: abs_url(&state.args.public_url, &url_rel),
-            thumb: abs_url(&state.args.public_url, &url_rel),
         }));
     }
 }
